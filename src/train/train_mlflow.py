@@ -1,14 +1,8 @@
+
 """Lab 3: train several candidate models and record every run in MLflow.
 
-    docker compose -f docker-compose.mlflow.yml up -d --wait     # the tracking server
+    docker compose -f docker-compose.mlflow.yml up -d --wait
     python -m src.train.train_mlflow
-
-Each candidate becomes one MLflow run that records:
-  parameters  which model and which settings          metrics   AUC, F1 overall and per slice, p95 latency, size
-  data hash   which exact data file it learned from   signature what goes in and what comes out
-  the model   so it can be loaded and served later    tags      which batch and which commit produced it
-
-Your work is marked TODO. Everything else is plumbing that is already done, so spend your time on the decisions.
 """
 
 import hashlib
@@ -35,8 +29,8 @@ from src import schema
 
 DATA_FILE = os.getenv("DATA_FILE", "data/churn_v1.csv")
 EXPERIMENT = "churn"
-SLICE_COLUMN = "contract"  # F1 is also reported for each contract type; TODO: change it if you prefer another slice
-BATCH = os.getenv("BATCH", os.getenv("GIT_SHA", "local")[:7])  # runs trained together share a batch tag
+SLICE_COLUMN = "contract"
+BATCH = os.getenv("BATCH", os.getenv("GIT_SHA", "local")[:7])
 
 
 def preprocessing() -> ColumnTransformer:
@@ -48,11 +42,12 @@ def preprocessing() -> ColumnTransformer:
     )
 
 
-# TODO 1: choose at least three candidates and justify them in MODEL_SELECTION.md.
-# Change the settings, not just the names: a different model family or a clearly different setting each time.
+# Three different candidate models
 CANDIDATES = {
     "logreg": LogisticRegression(max_iter=1000),
-    "random_forest": RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42),
+    "random_forest": RandomForestClassifier(
+        n_estimators=200, max_depth=8, random_state=42
+    ),
     "gradient_boosting": GradientBoostingClassifier(random_state=42),
 }
 
@@ -76,49 +71,94 @@ def size_kb(model) -> float:
 
 
 def main() -> None:
-    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"))
+    mlflow.set_tracking_uri(
+        os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+    )
     mlflow.set_experiment(EXPERIMENT)
 
     df = schema.validate(pd.read_csv(DATA_FILE))
     X, y = df[schema.FEATURES], df[schema.TARGET]
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
     data_sha = hashlib.sha256(Path(DATA_FILE).read_bytes()).hexdigest()[:12]
 
     for name, clf in CANDIDATES.items():
-        model = Pipeline([("prep", preprocessing()), ("clf", clf)]).fit(X_tr, y_tr)
+        model = Pipeline(
+            [("prep", preprocessing()), ("clf", clf)]
+        ).fit(X_tr, y_tr)
+
         proba = model.predict_proba(X_te)[:, 1]
         pred = proba > 0.5
 
         with mlflow.start_run(run_name=name) as run:
-            # parameters: what this run is
+            # Parameters
             mlflow.log_param("model", name)
-            mlflow.log_params({f"clf__{k}": v for k, v in clf.get_params().items()})
+            mlflow.log_params(
+                {f"clf__{k}": v for k, v in clf.get_params().items()}
+            )
             mlflow.log_param("data_file", DATA_FILE)
-            mlflow.log_param("data_sha256", data_sha)  # TODO 2 (explain in your video): why log a hash of the data?
-            mlflow.set_tags({"batch": BATCH, "git_sha": os.getenv("GIT_SHA", "local")})
+            mlflow.log_param("data_sha256", data_sha)
 
-            # metrics: how good it is
+            mlflow.set_tags(
+                {
+                    "batch": BATCH,
+                    "git_sha": os.getenv("GIT_SHA", "local"),
+                }
+            )
+
+            # Metrics
             metrics = {
                 "auc": roc_auc_score(y_te, proba),
                 "f1": f1_score(y_te, pred),
                 "p95_latency_ms": p95_latency_ms(model, X_te),
                 "size_kb": size_kb(model),
             }
+
             for value in X_te[SLICE_COLUMN].unique():
                 mask = (X_te[SLICE_COLUMN] == value).to_numpy()
-                metrics[f"f1_{SLICE_COLUMN}_{value}"] = f1_score(y_te[mask], pred[mask], zero_division=0)
-            mlflow.log_metrics({k: round(float(v), 4) for k, v in metrics.items()})
+                metrics[f"f1_{SLICE_COLUMN}_{value}"] = f1_score(
+                    y_te[mask], pred[mask], zero_division=0
+                )
 
-            # the model, with its signature (inputs and outputs) and an example row
+            mlflow.log_metrics(
+                {k: round(float(v), 4) for k, v in metrics.items()}
+            )
+
+            # Model signature and logging
             signature = infer_signature(X_te, proba)
-            info = mlflow.sklearn.log_model(model, name="model", signature=signature, input_example=X_te.head(3))
+
+            info = mlflow.sklearn.log_model(
+                model,
+                name="model",
+                signature=signature,
+                input_example=X_te.head(3),
+                skops_trusted_types=["sklearn.tree._tree.Tree"],
+            )
+
             mlflow.set_tag("model_uri", info.model_uri)
 
-            print(f"{name:18s} run {run.info.run_id[:8]}  auc {metrics['auc']:.3f}  f1 {metrics['f1']:.3f}  "
-                  f"p95 {metrics['p95_latency_ms']:.1f} ms  size {metrics['size_kb']:.0f} KB")
+            print(
+                f"{name:18s} run {run.info.run_id[:8]}  "
+                f"auc {metrics['auc']:.3f}  "
+                f"f1 {metrics['f1']:.3f}  "
+                f"p95 {metrics['p95_latency_ms']:.1f} ms  "
+                f"size {metrics['size_kb']:.0f} KB"
+            )
 
-    print(json.dumps({"batch": BATCH, "experiment": EXPERIMENT, "data_sha256": data_sha}))
+    print(
+        json.dumps(
+            {
+                "batch": BATCH,
+                "experiment": EXPERIMENT,
+                "data_sha256": data_sha,
+            }
+        )
+    )
 
 
 if __name__ == "__main__":
     main()
+
