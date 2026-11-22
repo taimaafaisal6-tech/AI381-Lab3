@@ -50,3 +50,10 @@ I selected Logistic Regression. It achieved the highest AUC (0.798) and F1 (0.49
 
 I would investigate the low F1 for one-year and two-year contract customers and check whether these groups have fewer training examples or different churn patterns.
 
+
+
+## Promotion gate validation
+
+I tested the promotion gate using a temporary champion file with an F1 score of 0.990. The current candidate achieved an F1 score of 0.495, so the gate correctly rejected it.
+
+The gate printed `BLOCKED` and returned a non-zero exit code. The original champion file remained unchanged, confirming that a weaker model cannot replace the current champion.
